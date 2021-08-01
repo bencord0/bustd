@@ -63,6 +63,7 @@ dependencies = [
  "cc",
  "cfg-if",
  "daemonize",
+ "lazy_static",
  "libc",
  "no-panic",
  "procfs",

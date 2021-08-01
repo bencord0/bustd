@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs;
 use std::time::Duration;
 use std::{ffi::OsStr, time::Instant};
@@ -10,10 +11,21 @@ use crate::error::{Error, Result};
 use crate::process::Process;
 use crate::utils;
 
+lazy_static! {
+    static ref UNTOUCHABLES: HashSet<&'static str> = {
+        let mut hs = HashSet::new();
+        hs.insert("qemu-system-x86_64");
+        hs.insert("qemu-system-x86");
+        hs.insert("emerge");
+        hs
+    };
+}
+
 pub fn choose_victim(mut proc_buf: &mut [u8], mut buf: &mut [u8]) -> Result<Process> {
     let now = Instant::now();
 
-    let mut processes = fs::read_dir("/proc/")?
+
+    let processes = fs::read_dir("/proc/")?
         .into_iter()
         .filter_map(|e| e.ok())
         .filter_map(|entry| {
@@ -30,30 +42,39 @@ pub fn choose_victim(mut proc_buf: &mut [u8], mut buf: &mut [u8]) -> Result<Proc
         .filter(|pid| *pid > 1)
         .filter_map(|pid| Process::from_pid(pid, &mut proc_buf).ok());
 
-    let first_process = processes.next();
-    if first_process.is_none() {
-        // Likely an impossible scenario but we found no process to kill!
-        return Err(Error::ProcessNotFound("choose_victim"));
-    }
-
-    let mut victim = first_process.unwrap();
-    // TODO: find another victim if victim.vm_rss_kib() fails here
-    let mut victim_vm_rss_kib = victim.vm_rss_kib(&mut buf)?;
+    let mut victim = Option::<Process>::None;
+    let mut victim_vm_rss_kib = 0;
 
     for process in processes {
-        if victim.oom_score > process.oom_score {
-            // Our current victim is less innocent than the process being analysed
+        let comm = process.comm(&mut buf)?;
+        if UNTOUCHABLES.contains(comm) {
+            println!("skipping: {}", comm);
             continue;
         }
 
-        let cur_vm_rss_kib = process.vm_rss_kib(&mut buf)?;
+        let cur_vm_rss_kib = match process.vm_rss_kib(&mut buf) {
+            Ok(vm_rss_kib) => vm_rss_kib,
+            Err(_) => continue,
+        };
+
         if cur_vm_rss_kib == 0 {
             // Current process is a kernel thread
             continue;
         }
 
-        if process.oom_score == victim.oom_score && cur_vm_rss_kib <= victim_vm_rss_kib {
-            continue;
+        if victim_vm_rss_kib == 0 {
+            victim_vm_rss_kib = cur_vm_rss_kib;
+        }
+
+        if let Some(victim) = &mut victim {
+            if victim.oom_score > process.oom_score {
+                // Our current victim is less innocent than the process being analysed
+                continue;
+            }
+
+            if process.oom_score == victim.oom_score && cur_vm_rss_kib <= victim_vm_rss_kib {
+                continue;
+            }
         }
 
         let cur_oom_score_adj = match process.oom_score_adj(&mut buf) {
@@ -66,20 +87,23 @@ pub fn choose_victim(mut proc_buf: &mut [u8], mut buf: &mut [u8]) -> Result<Proc
             continue;
         }
 
-        // eprintln!("[DBG] New victim with PID={}!", process.pid);
-        victim = process;
+        eprintln!("[DBG] New victim with PID={}!", process.pid);
+        victim = Some(process);
         victim_vm_rss_kib = cur_vm_rss_kib;
     }
 
-    println!("[LOG] Found victim in {} secs.", now.elapsed().as_secs());
-    println!(
-        "[LOG] Victim => pid: {}, comm: {}, oom_score: {}",
-        victim.pid,
-        victim.comm(&mut buf).unwrap_or_else(|_| "unknown").trim(),
-        victim.oom_score
-    );
+    if let Some(victim) = victim {
+        println!("[LOG] Found victim in {} secs.", now.elapsed().as_secs());
+        println!(
+            "[LOG] Victim => pid: {}, comm: {}, oom_score: {}",
+            victim.pid, victim.comm(&mut buf)?, victim.oom_score
+        );
 
-    Ok(victim)
+        Ok(victim)
+    } else {
+        // Likely an impossible scenario but we found no process to kill!
+        Err(Error::ProcessNotFound("choose_victim"))
+    }
 }
 
 pub fn kill_process(pid: i32, signal: i32) -> Result<()> { 

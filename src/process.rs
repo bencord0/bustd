@@ -52,7 +52,7 @@ impl Process {
             let _ = file.read(&mut buf)?;
         }
 
-        str_from_u8(buf)
+        Ok(str_from_u8(buf).unwrap_or_else(|_| "unknown").trim())
     }
 
     pub fn oom_score_from_pid(pid: u32, mut buf: &mut [u8]) -> Result<i16> {
